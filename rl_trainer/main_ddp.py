@@ -10,6 +10,7 @@ base_dir = Path(__file__).resolve().parent.parent
 sys.path.append(str(base_dir))
 
 from tensorboardX import SummaryWriter
+from tqdm import tqdm
 from algo.ddpg_ddp import DDPG_DDP
 from common import *
 from log_path import *
@@ -31,15 +32,15 @@ def main_worker(local_rank, args):
     rank = local_rank  # 在 torchrun 中，local_rank 就是全局 rank
     world_size = torch.cuda.device_count()
 
+    # 为每个进程分配不同的 GPU（必须在 init_process_group 之前）
+    torch.cuda.set_device(local_rank)
+
+    # 初始化分布式环境
     torch.distributed.init_process_group(
         backend='nccl',
         rank=rank,
         world_size=world_size
     )
-
-    # 为每个进程分配不同的 GPU
-    torch.cuda.set_device(local_rank)
-    device = torch.device(f"cuda:{local_rank}")
 
     # 只在 rank 0 进程输出日志
     if rank == 0:
@@ -47,8 +48,14 @@ def main_worker(local_rank, args):
         print(f"Starting DDP training with {world_size} GPUs")
         print(f"Local rank: {local_rank}, Global rank: {rank}, World size: {world_size}")
         print("=" * 80)
+        print(f"\n【训练策略】方案 B：每卡独立采样，梯度累加")
+        print(f"  - batch_size: {args.batch_size} × {world_size} GPUs = 有效 batch_size {args.batch_size * world_size}")
+        print(f"  - 学习率: {args.a_lr} × {world_size} = {args.a_lr * world_size}")
+        print(f"  - 梯度更新频率: {world_size}x（每 episode 有 {world_size} 倍的梯度更新）")
+        print(f"  - 预期效果: 更新频率高，可能更快收敛，但超参需验证")
+        print("=" * 80)
         print("==algo: ", args.algo)
-        print(f'device: {device}')
+        print(f'device: cuda:{local_rank}')
         print(f'model episode: {args.model_episode}')
         print(f'save interval: {args.save_interval}')
         print(f'[v3.0] opponent difficulty strategy: {args.opponent_difficulty_strategy}')
@@ -101,19 +108,24 @@ def main_worker(local_rank, args):
         print(f"Log directory: {log_dir}")
 
     # 创建模型（使用 DDP 包装）
-    model = DDPG_DDP(obs_dim, act_dim, ctrl_agent_num, args, device, rank=rank)
+    model = DDPG_DDP(obs_dim, act_dim, ctrl_agent_num, args, local_rank=local_rank)
 
     if args.load_model:
         if rank == 0:
             print(f"Loading model from run {args.load_model_run}, episode {args.load_model_run_episode}")
-        load_dir = os.path.join(os.path.dirname(run_dir), "run" + str(args.load_model_run)) if run_dir else \
-                   os.path.join(os.path.dirname(os.path.dirname(log_dir)), "run" + str(args.load_model_run))
+        # 计算 load_dir - 所有进程使用相同的路径结构
+        base_dir_path = Path(__file__).resolve().parent.parent
+        load_dir = os.path.join(str(base_dir_path), 'rl_trainer', 'models', args.game_name,
+                               "run" + str(args.load_model_run))
         model.load_model(load_dir, episode=args.load_model_run_episode)
 
     # 同步所有进程
     torch.distributed.barrier()
 
     episode = 0
+
+    # 进度条（仅在 rank 0 显示）
+    pbar = tqdm(total=args.max_episodes, desc="Training", disable=(rank != 0))
 
     while episode < args.max_episodes:
 
@@ -125,6 +137,7 @@ def main_worker(local_rank, args):
         obs = get_observations(state_to_training, ctrl_agent_index, obs_dim, height, width)
 
         episode += 1
+        pbar.update(1)
         step = 0
         episode_reward = np.zeros(6)
 
@@ -204,6 +217,9 @@ def main_worker(local_rank, args):
 
         # 同步所有进程（确保所有 GPU 进度一致）
         torch.distributed.barrier()
+
+    # 关闭进度条
+    pbar.close()
 
     # 清理分布式环境
     torch.distributed.destroy_process_group()

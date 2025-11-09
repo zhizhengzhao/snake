@@ -6,3 +6,4 @@ pillow
 numpy
 tabulate
 pyyaml
+tqdm

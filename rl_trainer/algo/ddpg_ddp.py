@@ -17,14 +17,22 @@ class DDPG_DDP:
     使用 torch.nn.parallel.DistributedDataParallel 包装 actor 和 critic 网络。
     """
 
-    def __init__(self, obs_dim, act_dim, num_agent, args, device, rank=0):
+    def __init__(self, obs_dim, act_dim, num_agent, args, local_rank=0):
         self.obs_dim = obs_dim
         self.act_dim = act_dim
         self.num_agent = num_agent
-        self.device = device
-        self.rank = rank  # 当前进程的 rank
-        self.a_lr = args.a_lr
-        self.c_lr = args.c_lr
+        self.local_rank = local_rank
+        self.rank = local_rank  # 当前进程的 rank
+        self.device = torch.device(f"cuda:{local_rank}")
+
+        # 获取 world_size（用于学习率调整）
+        self.world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
+
+        # 方案 B：每卡独立采样，梯度累加
+        # 学习率乘以 world_size 来补偿梯度平均
+        self.a_lr = args.a_lr * self.world_size
+        self.c_lr = args.c_lr * self.world_size
+
         self.batch_size = args.batch_size
         self.gamma = args.gamma
         self.tau = args.tau
@@ -40,10 +48,10 @@ class DDPG_DDP:
         # Wrap models with DistributedDataParallel
         # find_unused_parameters=True 允许某些参数不被更新（如果有的话）
         self.actor = torch.nn.parallel.DistributedDataParallel(
-            actor, device_ids=[self.device], output_device=self.device, find_unused_parameters=True
+            actor, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True
         )
         self.critic = torch.nn.parallel.DistributedDataParallel(
-            critic, device_ids=[self.device], output_device=self.device, find_unused_parameters=True
+            critic, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True
         )
 
         self.actor_optimizer = torch.optim.Adam(self.actor.parameters(), lr=self.a_lr)
@@ -54,10 +62,10 @@ class DDPG_DDP:
         critic_target = Critic(obs_dim, act_dim, num_agent, args).to(self.device)
 
         self.actor_target = torch.nn.parallel.DistributedDataParallel(
-            actor_target, device_ids=[self.device], output_device=self.device, find_unused_parameters=True
+            actor_target, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True
         )
         self.critic_target = torch.nn.parallel.DistributedDataParallel(
-            critic_target, device_ids=[self.device], output_device=self.device, find_unused_parameters=True
+            critic_target, device_ids=[self.local_rank], output_device=self.local_rank, find_unused_parameters=True
         )
 
         hard_update(self.actor, self.actor_target)
@@ -90,11 +98,25 @@ class DDPG_DDP:
         return np.random.uniform(low=0, high=1, size=(self.num_agent, self.act_dim))
 
     def update(self):
+        """
+        方案 B：每卡独立采样，梯度累加（8倍更新频率）
 
+        工作原理：
+        - 每个 GPU 进程独立采样 batch_size (128) 的数据
+        - 每个进程计算梯度（8 个进程 = 8 倍梯度数据）
+        - DDP 在 backward() 时自动平均梯度（除以 world_size）
+        - 学习率已乘以 world_size，补偿梯度平均
+        - 结果：等价于有效 batch_size = 128 * 8 = 1024
+
+        超参效果：
+        - 更新频率：8 倍（每 episode 有 8 倍的梯度更新）
+        - 学习动态：相当于更大的有效 batch size
+        - 收敛速度：可能更快，但需要验证超参稳定性
+        """
         if len(self.replay_buffer) < self.batch_size:
             return None, None
 
-        # Sample a mini-batch of M transitions from R
+        # 每个进程独立采样 batch_size 的数据（不共享）
         state_batch, action_batch, reward_batch, next_state_batch, done_batch = self.replay_buffer.get_batches()
 
         state_batch = torch.Tensor(state_batch).reshape(self.batch_size, self.num_agent, -1).to(self.device)
