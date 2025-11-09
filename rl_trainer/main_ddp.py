@@ -238,7 +238,7 @@ if __name__ == '__main__':
     parser.add_argument('--seed', default=1, type=int)
     parser.add_argument('--a_lr', default=0.0001, type=float)
     parser.add_argument('--c_lr', default=0.0001, type=float)
-    parser.add_argument('--batch_size', default=64, type=int)
+    parser.add_argument('--batch_size', default=512, type=int)
     parser.add_argument('--epsilon', default=0.5, type=float)
     parser.add_argument('--epsilon_speed', default=0.99998, type=float)
 
