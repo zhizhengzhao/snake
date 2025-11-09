@@ -59,9 +59,70 @@ def make_grid_map(board_width, board_height, beans_positions:list, snakes_positi
 
 # Self position:        0:head_x; 1:head_y
 # Head surroundings:    2:head_up; 3:head_down; 4:head_left; 5:head_right
-# Beans positions:      (6, 7) (8, 9) (10, 11) (12, 13) (14, 15)
-# Other snake positions: (16, 17) (18, 19) (20, 21) (22, 23) (24, 25) -- (other_x - self_x, other_y - self_y)
+# Nearest bean relative: [6, 7, 8] (dx, dy, distance)
+# Next nearest bean relative: [9, 10, 11] (dx, dy, distance)
+# Threat assessment: [12, 13] (enemy1_threat, enemy2_threat)
+# Original beans: [14, 25]
+# Original snakes: [26, 29]
 def get_observations(state, agents_index, obs_dim, height, width):
+    """
+    扩展观测空间 - 26维 → 30维，包含相对距离特征和威胁评分
+    """
+    def _get_nearest_beans(head_x, head_y, beans_positions, board_width, board_height, top_k=2):
+        """获取最近的K个豆子的相对位置信息"""
+        if len(beans_positions) == 0:
+            return [(0, 0, board_width * 2) for _ in range(top_k)]
+
+        bean_info = []
+        for bean_y, bean_x in beans_positions:
+            dx = bean_x - head_x
+            dy = bean_y - head_y
+            # 考虑环形地图的最短距离
+            dx = dx if abs(dx) <= board_width // 2 else dx - np.sign(dx) * board_width
+            dy = dy if abs(dy) <= board_height // 2 else dy - np.sign(dy) * board_height
+            distance = np.sqrt(dx**2 + dy**2)
+            bean_info.append((dx, dy, distance))
+
+        # 按距离排序，取最近的K个
+        bean_info.sort(key=lambda x: x[2])
+        nearest = bean_info[:top_k]
+
+        # 补充缺失的豆子信息
+        while len(nearest) < top_k:
+            nearest.append((0, 0, board_width * 2))
+
+        return nearest
+
+    def _get_threat_info(head_pos, snakes_positions, agent_index, board_width, board_height):
+        """评估来自其他蛇的威胁程度"""
+        threat_scores = []
+        self_head = np.array(head_pos)
+
+        for i, snake_pos in enumerate(snakes_positions):
+            if i == agent_index:
+                continue
+
+            enemy_head = np.array(snake_pos[0])
+            dx = enemy_head[1] - self_head[1]
+            dy = enemy_head[0] - self_head[0]
+
+            # 考虑环形地图的最短距离
+            dx = dx if abs(dx) <= board_width // 2 else dx - np.sign(dx) * board_width
+            dy = dy if abs(dy) <= board_height // 2 else dy - np.sign(dy) * board_height
+
+            distance = np.sqrt(dx**2 + dy**2) + 1e-8
+            snake_length = len(snake_pos)
+
+            # 威胁评分
+            threat_score = (1.0 / (distance + 1)) * (snake_length / 3.0)
+            threat_scores.append(threat_score)
+
+        # 补充缺失的威胁信息
+        while len(threat_scores) < 2:
+            threat_scores.append(0.0)
+
+        return threat_scores[:2]
+
     state_copy = state.copy()
     board_width = state_copy['board_width']
     board_height = state_copy['board_height']
@@ -76,25 +137,40 @@ def get_observations(state, agents_index, obs_dim, height, width):
 
     observations = np.zeros((3, obs_dim))
     snakes_position = np.array(snakes_positions_list, dtype=object)
-    beans_position = np.array(beans_positions, dtype=object).flatten()
-    for i, element in enumerate(agents_index):
-        # # self head position
-        observations[i][:2] = snakes_positions_list[element][0][:]
+    beans_position = np.array(beans_positions, dtype=object)
 
-        # head surroundings
-        head_x = snakes_positions_list[element][0][1]
-        head_y = snakes_positions_list[element][0][0]
+    for i in agents_index:
+        # [0-1] self head position
+        observations[i][:2] = snakes_position[i][0][:]
 
+        # [2-5] head surroundings
+        head_x = snakes_position[i][0][1]
+        head_y = snakes_position[i][0][0]
         head_surrounding = get_surrounding(state_, width, height, head_x, head_y)
         observations[i][2:6] = head_surrounding[:]
 
-        # beans positions
-        observations[i][6:16] = beans_position[:]
+        # [6-11] 最近和次近豆子的相对位置
+        nearest_beans = _get_nearest_beans(head_x, head_y, beans_position, board_width, board_height, top_k=2)
+        for j, (dx, dy, dist) in enumerate(nearest_beans):
+            base_idx = 6 + j * 3
+            observations[i][base_idx] = dx
+            observations[i][base_idx + 1] = dy
+            observations[i][base_idx + 2] = dist
 
-        # other snake positions
+        # [12-13] 威胁评分
+        threat_scores = _get_threat_info(snakes_position[i][0], snakes_position, i, board_width, board_height)
+        observations[i][12:14] = threat_scores
+
+        # [14-25] 原始豆子位置 (兼容性)
+        beans_flat = beans_position.flatten()
+        observations[i][14:min(14 + len(beans_flat), 26)] = beans_flat[:min(len(beans_flat), 12)]
+
+        # [26-29] 对手蛇头相对位置
         snake_heads = np.array([snake[0] for snake in snakes_position])
-        snake_heads = np.delete(snake_heads, i, 0)
-        observations[i][16:] = snake_heads.flatten()[:]
+        snake_heads_relative = np.delete(snake_heads, i, 0)
+        snake_heads_flat = snake_heads_relative.flatten()[:4]
+        observations[i][26:26 + len(snake_heads_flat)] = snake_heads_flat
+
     return observations
 
 
@@ -127,7 +203,11 @@ class RLAgent(object):
         self.num_agent = num_agent
         self.device = device
         self.output_activation = 'softmax'
-        self.actor = Actor(obs_dim, act_dim, num_agent, self.output_activation).to(self.device)
+        # 创建一个虚拟的args对象来满足Actor的要求
+        class Args:
+            pass
+        args = Args()
+        self.actor = Actor(obs_dim, act_dim, num_agent, args, self.output_activation).to(self.device)
 
     def choose_action(self, obs):
         obs = torch.Tensor([obs]).to(self.device)
@@ -160,13 +240,13 @@ def logits2action(logits):
 
 
 
-agent = RLAgent(26, 4, 3)
+agent = RLAgent(30, 4, 3)
 actor_net = os.path.dirname(os.path.abspath(__file__)) + "/actor_2000.pth"
 agent.load_model(actor_net)
 
 
 def my_controller(observation_list, action_space_list, is_act_continuous):
-    obs_dim = 26
+    obs_dim = 30
     obs = observation_list.copy()
     board_width = obs['board_width']
     board_height = obs['board_height']

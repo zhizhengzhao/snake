@@ -17,7 +17,7 @@ def get_actions(state, algo, indexs):
 
     # rl agent
     if algo == 'rl':
-        obs = get_observations(state, indexs, obs_dim=26, height=10, width=20)
+        obs = get_observations(state, indexs, obs_dim=30, height=10, width=20)
         logits = agent.choose_action(obs)
         logits = torch.Tensor(logits)
         actions = np.array([Categorical(out).sample().item() for out in logits])
