@@ -89,22 +89,28 @@ python -c "import torch; print(f'CUDA Available: {torch.cuda.is_available()}'); 
 #### 方法 A：使用脚本启动（推荐）
 
 ```bash
-# 基础命令 - 自动检测 GPU 数量
+# 基础命令 - 自动检测 GPU 数量，8卡训练约6250 episodes（= 单卡50k/8）
 chmod +x train_ddp.sh
 ./train_ddp.sh
 
+# 如果要更多 episodes（会更多计算）
+./train_ddp.sh --max_episodes 12500
+
 # 自定义参数
-./train_ddp.sh --max_episodes 100000 --epsilon 0.8 --opponent_difficulty_strategy curriculum
+./train_ddp.sh --max_episodes 6250 --epsilon 0.8 --opponent_difficulty_strategy curriculum
 ```
 
 #### 方法 B：直接使用 torchrun
 
 ```bash
-# 8 卡训练
+# 8 卡训练（默认 6250 episodes = 单卡 50k/8）
 torchrun --nproc_per_node=8 rl_trainer/main_ddp.py
 
+# 如果要更多 episodes（计算量更大）
+torchrun --nproc_per_node=8 rl_trainer/main_ddp.py --max_episodes 12500
+
 # 自定义参数
-torchrun --nproc_per_node=8 rl_trainer/main_ddp.py --max_episodes 100000 --batch_size 128
+torchrun --nproc_per_node=8 rl_trainer/main_ddp.py --max_episodes 6250 --batch_size 128
 
 # 只用 4 卡（如果 GPU 不足）
 torchrun --nproc_per_node=4 rl_trainer/main_ddp.py
@@ -146,7 +152,7 @@ DDP 版本支持所有原始参数，训练逻辑完全相同。
 ### 常用参数
 
 ```bash
---max_episodes 50000           # 最大训练回合数 (default: 50000)
+--max_episodes 6250            # 最大训练回合数 (default: 6250 = 单卡50k/8, 保持梯度更新数相同)
 --batch_size 128               # 批处理大小 (default: 128)
 --epsilon 0.5                  # 初始探索率 (default: 0.5)
 --epsilon_speed 0.9995         # epsilon 衰减速度 (default: 0.9995)
@@ -170,26 +176,27 @@ DDP 版本支持所有原始参数，训练逻辑完全相同。
 ### 完整示例
 
 ```bash
-# 高效的训练设置
+# 默认设置（8卡，6250 episodes = 单卡50k/8 的梯度更新数）
+torchrun --nproc_per_node=8 rl_trainer/main_ddp.py
+
+# 如果要加倍计算（12500 episodes）
 torchrun --nproc_per_node=8 rl_trainer/main_ddp.py \
-  --max_episodes 100000 \
-  --batch_size 128 \
-  --epsilon 0.5 \
+  --max_episodes 12500 \
   --opponent_difficulty_strategy curriculum \
-  --save_interval 1000
+  --save_interval 500
 
 # 从已有模型继续训练
 torchrun --nproc_per_node=8 rl_trainer/main_ddp.py \
   --load_model \
   --load_model_run 1 \
-  --load_model_run_episode 50000 \
-  --max_episodes 100000
+  --load_model_run_episode 6250 \
+  --max_episodes 6250
 
 # 启用躲避型对手（计算开销大）
 torchrun --nproc_per_node=8 rl_trainer/main_ddp.py \
-  --max_episodes 100000 \
+  --max_episodes 6250 \
   --enable_opponent_evasion \
-  --opponent_evasion_start_episode 40000
+  --opponent_evasion_start_episode 5000
 ```
 
 ---

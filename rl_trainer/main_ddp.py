@@ -50,9 +50,11 @@ def main_worker(local_rank, args):
         print("=" * 80)
         print(f"\n【训练策略】方案 B：每卡独立采样，梯度累加")
         print(f"  - batch_size: {args.batch_size} × {world_size} GPUs = 有效 batch_size {args.batch_size * world_size}")
+        print(f"  - episodes: {args.max_episodes} (单卡50k / {world_size} = 6.25k，保持梯度更新数相同)")
         print(f"  - 学习率: {args.a_lr} × {world_size} = {args.a_lr * world_size}")
         print(f"  - 梯度更新频率: {world_size}x（每 episode 有 {world_size} 倍的梯度更新）")
-        print(f"  - 预期效果: 更新频率高，可能更快收敛，但超参需验证")
+        print(f"  - 总梯度更新数: {args.max_episodes} × {world_size} = {args.max_episodes * world_size} (≈ 单卡50k)")
+        print(f"  - 预期训练时间: ~1/{world_size} 倍的单卡训练时间（扣除通信开销）")
         print("=" * 80)
         print("==algo: ", args.algo)
         print(f'device: cuda:{local_rank}')
@@ -92,7 +94,7 @@ def main_worker(local_rank, args):
     if rank == 0:
         print(f'observation dimension: {obs_dim}')
 
-    # 所有进程使用相同的随机种子以确保初始化一致
+    # ================== 第一步：相同的随机种子用于模型初始化 ==================
     torch.manual_seed(args.seed)
     np.random.seed(args.seed)
 
@@ -108,7 +110,13 @@ def main_worker(local_rank, args):
         print(f"Log directory: {log_dir}")
 
     # 创建模型（使用 DDP 包装）
+    # 此时所有进程的模型权重初始化一致（因为用了相同的 seed）
     model = DDPG_DDP(obs_dim, act_dim, ctrl_agent_num, args, local_rank=local_rank)
+
+    # ================== 第二步：不同的随机种子用于数据采样 ==================
+    # 这样每个进程会采样不同的 batch，实现真正的方案 B
+    torch.manual_seed(args.seed + rank)
+    np.random.seed(args.seed + rank)
 
     if args.load_model:
         if rank == 0:
@@ -231,7 +239,8 @@ if __name__ == '__main__':
     parser = argparse.ArgumentParser()
     parser.add_argument('--game_name', default="snakes_3v3", type=str)
     parser.add_argument('--algo', default="ddpg", type=str, help="bicnet/ddpg")
-    parser.add_argument('--max_episodes', default=50000, type=int)
+    parser.add_argument('--max_episodes', default=6250, type=int,
+                       help="DDP版本：默认6250 (= 单卡50000/8)，保持梯度更新数相同")
     parser.add_argument('--episode_length', default=200, type=int)
     parser.add_argument('--output_activation', default="softmax", type=str, help="tanh/softmax")
 
