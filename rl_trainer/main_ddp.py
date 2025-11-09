@@ -142,6 +142,7 @@ def main_worker(local_rank, args):
         pbar.update(1)
         step = 0
         episode_reward = np.zeros(6)
+        update_counter = 0  # 累计 step 数，用于控制更新频率
 
         while True:
 
@@ -179,7 +180,15 @@ def main_worker(local_rank, args):
             # ================================== collect data ========================================
             model.replay_buffer.push(obs, logits, step_reward, next_obs, done)
 
-            model.update()
+            # ================================== gradient update =======================================
+            # 降低更新频率：每 update_interval 个 step 更新一次
+            # 这样可以积累更多数据，让 GPU 计算时间 > 环境采样时间
+            update_counter += 1
+            if update_counter >= args.update_interval:
+                # 执行多次更新，以平衡环境采样和 GPU 计算的时间
+                for _ in range(args.update_interval):
+                    model.update()
+                update_counter = 0
 
             obs = next_obs
             state_to_training = next_state_to_training
@@ -245,6 +254,9 @@ if __name__ == '__main__':
     parser.add_argument("--save_interval", default=1000, type=int)
     parser.add_argument("--model_episode", default=0, type=int)
     parser.add_argument('--log_dir', default=datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
+    parser.add_argument("--update_interval", default=1, type=int,
+                       help="每 N 个 step 执行一次梯度更新（默认=1，每步更新）。"
+                            "增加此值可提高 GPU 利用率（GPU 计算时间 > 环境采样时间）")
 
     parser.add_argument("--load_model", action='store_true')
     parser.add_argument("--load_model_run", default=2, type=int)
