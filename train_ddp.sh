@@ -5,17 +5,6 @@
 # Distributed Data Parallel Training Script for 8 GPUs
 # ============================================================================
 
-# 确保 torchrun 已安装
-# Make sure torchrun is installed: pip install torch
-
-# 基础用法 / Basic usage:
-# ./train_ddp.sh
-
-# 自定义参数 / Custom parameters:
-# ./train_ddp.sh --max_episodes 100000 --epsilon 0.8
-
-# ============================================================================
-
 # 检查 GPU 数量
 GPU_COUNT=$(python3 -c "import torch; print(torch.cuda.device_count())")
 echo "检测到 GPU 数量: $GPU_COUNT"

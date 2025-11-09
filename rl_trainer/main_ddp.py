@@ -15,7 +15,6 @@ from algo.ddpg_ddp import DDPG_DDP
 from common import *
 from log_path import *
 from env.chooseenv import make
-from common import get_opponent_difficulty
 
 os.environ['KMP_DUPLICATE_LIB_OK'] = 'True'
 
@@ -48,24 +47,19 @@ def main_worker(local_rank, args):
         print(f"Starting DDP training with {world_size} GPUs")
         print(f"Local rank: {local_rank}, Global rank: {rank}, World size: {world_size}")
         print("=" * 80)
-        print(f"\n【训练策略】方案 B：每卡独立采样，梯度累加")
-        print(f"  - batch_size: {args.batch_size} × {world_size} GPUs = 有效 batch_size {args.batch_size * world_size}")
-        print(f"  - episodes: {args.max_episodes} (单卡50k / {world_size} = 6.25k，保持梯度更新数相同)")
-        print(f"  - 学习率: {args.a_lr} × {world_size} = {args.a_lr * world_size}")
-        print(f"  - 梯度更新频率: {world_size}x（每 episode 有 {world_size} 倍的梯度更新）")
-        print(f"  - 总梯度更新数: {args.max_episodes} × {world_size} = {args.max_episodes * world_size} (≈ 单卡50k)")
-        print(f"  - 预期训练时间: ~1/{world_size} 倍的单卡训练时间（扣除通信开销）")
+        print(f"\n【训练策略】标准数据并行（Data Parallel）")
+        print(f"  - 每卡采样 batch_size: {args.batch_size}")
+        print(f"  - 有效 batch_size: {args.batch_size} × {world_size} = {args.batch_size * world_size}")
+        print(f"  - 梯度同步: DDP 自动平均（AllReduce / {world_size}）")
+        print(f"  - 学习率: {args.a_lr}（保持不变）")
+        print(f"  - episodes: {args.max_episodes} (= 单卡50k / {world_size}，总计算量相同）")
+        print(f"  - 总梯度计算: {args.max_episodes} × {world_size} ≈ 单卡50k episodes")
+        print(f"  - 预期加速: ~{world_size}x（主要受环境采样限制，实际 ~{world_size-1}x）")
         print("=" * 80)
-        print("==algo: ", args.algo)
-        print(f'device: cuda:{local_rank}')
-        print(f'model episode: {args.model_episode}')
-        print(f'save interval: {args.save_interval}')
-        print(f'[v3.0] opponent difficulty strategy: {args.opponent_difficulty_strategy}')
 
     # 同步所有进程
     torch.distributed.barrier()
 
-    # 创建环境（所有进程都创建同一个环境，但只有 rank 0 保存日志）
     env = make(args.game_name, conf=None)
 
     num_agents = env.n_player
@@ -90,7 +84,7 @@ def main_worker(local_rank, args):
     if rank == 0:
         print(f'action dimension: {act_dim}')
 
-    obs_dim = 30
+    obs_dim = 35  # 扩展观测维度
     if rank == 0:
         print(f'observation dimension: {obs_dim}')
 
@@ -149,18 +143,13 @@ def main_worker(local_rank, args):
         step = 0
         episode_reward = np.zeros(6)
 
-        # [v3.0-v3.1] 计算本轮难度
-        opponent_difficulty = get_opponent_difficulty(episode, args.max_episodes, args.opponent_difficulty_strategy)
-        enable_evasion = args.enable_opponent_evasion and episode >= args.opponent_evasion_start_episode
-
         while True:
 
             # ================================== inference ========================================
             logits = model.choose_action(obs)
 
             # ============================== add opponent actions =================================
-            actions = logits_greedy(state_to_training, logits, height, width,
-                                   opponent_difficulty=opponent_difficulty, enable_evasion=enable_evasion)
+            actions = logits_greedy(state_to_training, logits, height, width)
 
             # Receive reward and observe new state
             next_state, reward, done, _, info = env.step(env.encode(actions))
@@ -200,8 +189,7 @@ def main_worker(local_rank, args):
 
                 # 只在 rank 0 进程输出日志和保存模型
                 if rank == 0:
-                    evasion_str = ' [v3.1] evasion:ON' if enable_evasion else ''
-                    print(f'[Episode {episode:05d}] total_reward: {np.sum(episode_reward[0:3]):} epsilon: {model.eps:.2f} [v3.0] difficulty: {opponent_difficulty}{evasion_str}')
+                    print(f'[Episode {episode:05d}] total_reward: {np.sum(episode_reward[0:3]):} epsilon: {model.eps:.2f}')
                     print(f'\t\t\t\tsnake_1: {episode_reward[0]} '
                           f'snake_2: {episode_reward[1]} snake_3: {episode_reward[2]}')
 
@@ -245,26 +233,18 @@ if __name__ == '__main__':
     parser.add_argument('--output_activation', default="softmax", type=str, help="tanh/softmax")
 
     parser.add_argument('--buffer_size', default=int(1e5), type=int)
-    parser.add_argument('--tau', default=0.01, type=float, help="soft update coefficient (default: 0.01, was 0.001)")
-    parser.add_argument('--gamma', default=0.99, type=float, help="discount factor (default: 0.99, was 0.95)")
+    parser.add_argument('--tau', default=0.001, type=float)
+    parser.add_argument('--gamma', default=0.95, type=float)
     parser.add_argument('--seed', default=1, type=int)
-    parser.add_argument('--a_lr', default=0.0003, type=float, help="actor learning rate (default: 0.0003, was 0.0001)")
-    parser.add_argument('--c_lr', default=0.0003, type=float, help="critic learning rate (default: 0.0003, was 0.0001)")
-    parser.add_argument('--batch_size', default=128, type=int, help="batch size (default: 128, was 64)")
+    parser.add_argument('--a_lr', default=0.0001, type=float)
+    parser.add_argument('--c_lr', default=0.0001, type=float)
+    parser.add_argument('--batch_size', default=64, type=int)
     parser.add_argument('--epsilon', default=0.5, type=float)
-    parser.add_argument('--epsilon_speed', default=0.9995, type=float, help="epsilon decay (default: 0.9995, was 0.99998)")
+    parser.add_argument('--epsilon_speed', default=0.99998, type=float)
 
     parser.add_argument("--save_interval", default=1000, type=int)
     parser.add_argument("--model_episode", default=0, type=int)
     parser.add_argument('--log_dir', default=datetime.datetime.now().strftime('%Y%m%d_%H%M%S'))
-
-    # [v3.0-v3.1] 对手难度参数
-    parser.add_argument('--opponent_difficulty_strategy', default='curriculum', type=str,
-                       help="difficulty schedule strategy: linear/exponential/curriculum")
-    parser.add_argument('--enable_opponent_evasion', action='store_true',
-                       help="[v3.1] enable evasion-aware opponent (path planning). WARNING: significant computation overhead!")
-    parser.add_argument('--opponent_evasion_start_episode', default=40000, type=int,
-                       help="episode to start using evasion opponent (default: 40k, disabled if --enable_opponent_evasion not set)")
 
     parser.add_argument("--load_model", action='store_true')
     parser.add_argument("--load_model_run", default=2, type=int)

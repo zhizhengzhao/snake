@@ -13,8 +13,15 @@ from algo.network import Actor, Critic
 
 class DDPG_DDP:
     """
-    DDPG with Distributed Data Parallel support for multi-GPU training.
+    DDPG with Distributed Data Parallel (DDP) support for multi-GPU training.
     使用 torch.nn.parallel.DistributedDataParallel 包装 actor 和 critic 网络。
+
+    【标准数据并行】：
+    - 每张 GPU 独立采样 batch_size 的数据
+    - 每张 GPU 在自己的数据上计算梯度
+    - DDP 同步梯度：AllReduce + 平均
+    - 有效 batch_size = batch_size × world_size
+    - 学习率保持不变
     """
 
     def __init__(self, obs_dim, act_dim, num_agent, args, local_rank=0):
@@ -25,13 +32,16 @@ class DDPG_DDP:
         self.rank = local_rank  # 当前进程的 rank
         self.device = torch.device(f"cuda:{local_rank}")
 
-        # 获取 world_size（用于学习率调整）
+        # 获取 world_size
         self.world_size = torch.distributed.get_world_size() if torch.distributed.is_initialized() else 1
 
-        # 方案 B：每卡独立采样，梯度累加
-        # 学习率乘以 world_size 来补偿梯度平均
-        self.a_lr = args.a_lr * self.world_size
-        self.c_lr = args.c_lr * self.world_size
+        # 【标准数据并行】
+        # - DDP 会自动平均梯度（AllReduce + 除以 world_size）
+        # - 有效 batch_size = batch_size × world_size（因为 8 卡各采样 batch_size）
+        # - 学习率保持不变，DDP 会处理梯度平均
+        # - 每卡采样不同数据（seed+rank），实现数据多样性
+        self.a_lr = args.a_lr
+        self.c_lr = args.c_lr
 
         self.batch_size = args.batch_size
         self.gamma = args.gamma
@@ -83,7 +93,7 @@ class DDPG_DDP:
         p = np.random.random()
         if p > self.eps or evaluation:
             obs = torch.Tensor([obs]).to(self.device)
-            # 获取基础模块的输出（不需要 .module 因为我们在这里操作 DDP 包装的模型）
+            # 获取基础模块的输出
             with torch.no_grad():
                 action = self.actor(obs).cpu().detach().numpy()[0]
         else:
@@ -99,19 +109,21 @@ class DDPG_DDP:
 
     def update(self):
         """
-        方案 B：每卡独立采样，梯度累加（8倍更新频率）
+        【标准数据并行】每卡独立采样，梯度平均
 
         工作原理：
-        - 每个 GPU 进程独立采样 batch_size (128) 的数据
-        - 每个进程计算梯度（8 个进程 = 8 倍梯度数据）
-        - DDP 在 backward() 时自动平均梯度（除以 world_size）
-        - 学习率已乘以 world_size，补偿梯度平均
-        - 结果：等价于有效 batch_size = 128 * 8 = 1024
+        1. 每个 GPU 进程独立采样 batch_size (64) 的数据
+        2. 每个进程在自己的数据上计算梯度
+        3. DDP 在 backward() 时自动同步梯度：
+           - AllReduce(sum)：收集所有进程的梯度
+           - 除以 world_size：平均梯度
+        4. 优化器更新：θ -= lr * avg_gradient
 
-        超参效果：
-        - 更新频率：8 倍（每 episode 有 8 倍的梯度更新）
-        - 学习动态：相当于更大的有效 batch size
-        - 收敛速度：可能更快，但需要验证超参稳定性
+        关键特性：
+        - 有效 batch_size = 64 × 8 = 512（相当于单卡 batch_size=512）
+        - 数据多样性高：每卡采样不同数据（seed+rank）
+        - 梯度平均确保训练稳定
+        - 总计算量更大：8 卡并行计算梯度
         """
         if len(self.replay_buffer) < self.batch_size:
             return None, None
